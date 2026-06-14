@@ -1,0 +1,54 @@
+# Base configuration — all experiments inherit from this
+
+world_size: 4
+master_addr: "127.0.0.1"
+master_port: 29500
+backend: "gloo"
+
+model:
+  num_experts: 4
+  experts_per_rank: 1      # experts per rank (num_experts = world_size * experts_per_rank)
+  hidden_dim: 256
+  expert_hidden_mult: 4    # expert FFN hidden = hidden_dim * multiplier
+  top_k: 1
+  capacity_factor: 1.25
+
+data:
+  batch_size: 32
+  seq_len: 128
+  num_microbatches: 4
+
+routing:
+  strategy: "top2"  # fixed | top1 | top2 | uniform_random
+  jitter: 0.000005
+
+runtime:
+  mode: "serial"  # serial (baseline) | overlap (async compute/comm)
+  num_steps: 10
+
+delay:
+  enabled: false
+  comm_delay_us: 0       # injected per-alltoall delay in microseconds
+  comm_delay_jitter_us: 0
+
+# Hierarchical network topology (disabled by default -- uses flat delay instead).
+# Enable to model NVLink (intra-node), InfiniBand (intra-pod), and
+# cross-pod fabric with per-tier latency and bandwidth.
+topology:
+  enabled: false
+  num_pods: 1
+  nodes_per_pod: 1
+  ranks_per_node: 4        # must equal world_size when num_pods=nodes_per_pod=1
+  # Realistic defaults for GPU clusters:
+  intra_node_latency_us: 1.0      # NVLink
+  intra_pod_latency_us: 3.0       # InfiniBand
+  cross_pod_latency_us: 10.0      # IB fabric / Ethernet
+  intra_node_bandwidth_gbps: 900.0
+  intra_pod_bandwidth_gbps: 200.0
+  cross_pod_bandwidth_gbps: 100.0
+  delay_multiplier: 1.0
+
+profiling:
+  export_trace: true
+  trace_dir: "outputs/traces"
+  perfetto_friendly: true
