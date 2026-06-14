@@ -16,6 +16,8 @@ Thumbs.db
 # Project outputs (large trace files, runtime artifacts)
 outputs/traces/*.json
 !outputs/traces/.gitkeep
+*.pt
+*.pth
 
 # Virtual environments
 venv/

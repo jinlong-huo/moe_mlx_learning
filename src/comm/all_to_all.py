@@ -325,8 +325,9 @@ def combine_expert_outputs(
         Combined token representations [T, H]
     """
     if gate_weights.shape[1] == 1:
-        # top_k=1: already correct shape, just passthrough
-        return gathered
+        # top_k=1: apply gate weight (router softmax probability) for gradient flow.
+        # This provides a differentiable path from task loss → gate_weights → logits → gate.
+        return gathered * gate_weights
 
     T = gate_weights.shape[0]
     K = gate_weights.shape[1]

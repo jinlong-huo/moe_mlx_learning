@@ -21,12 +21,14 @@ from __future__ import annotations
 from typing import List, Tuple
 
 import torch
+import torch.distributed as dist
 
 from src.model.moe_layer import MoELayer
 from src.comm.transport import Transport
 from src.comm.all_to_all import (
     scatter_tokens, gather_tokens, combine_expert_outputs, DispatchResult,
 )
+from src.train.loss import compute_loss
 from src.utils.timer import Timer
 
 
@@ -41,7 +43,7 @@ def run_serial(
     for mb_idx, tokens in enumerate(microbatches):
         # Route: get expert assignments and gate weights
         timer.start(f"step/{step}/mb_{mb_idx}/route")
-        expert_ids, gate_weights = moe.router(tokens)
+        expert_ids, gate_weights, _logits = moe.router(tokens)
         timer.stop(f"step/{step}/mb_{mb_idx}/route")
 
         # Dispatch (blocking all-to-all) -- top-K flattening handled internally
@@ -99,7 +101,7 @@ def run_overlap(
     routes = []        # List[Tuple[expert_ids, gate_weights]]
     for mb_idx, tokens in enumerate(microbatches):
         timer.start(f"step/{step}/mb_{mb_idx}/route")
-        expert_ids, gate_weights = moe.router(tokens)
+        expert_ids, gate_weights, _logits = moe.router(tokens)
         timer.stop(f"step/{step}/mb_{mb_idx}/route")
         routes.append((expert_ids, gate_weights))
 
@@ -193,3 +195,82 @@ def run_overlap(
         timer.start(f"step/{step}/mb_{last}/combine")
         combined = combine_expert_outputs(gathered_last, prev_gate_weights)
         timer.stop(f"step/{step}/mb_{last}/combine")
+
+
+# ── Training schedulers ────────────────────────────────────────────────
+
+
+def run_train_serial(
+    step: int,
+    microbatches: List[torch.Tensor],
+    targets: List[torch.Tensor],
+    moe: MoELayer,
+    transport: Transport,
+    optimizer: torch.optim.Optimizer,
+    timer: Timer,
+    alpha: float = 0.01,
+) -> dict:
+    """Training serial step: forward → loss → backward → optimizer.step().
+
+    Returns a metrics dict with per-microbatch breakdown.
+    """
+    mb_metrics = []
+
+    for mb_idx, (tokens, tgt) in enumerate(zip(microbatches, targets)):
+        # ── Forward ──
+        timer.start(f"step/{step}/mb_{mb_idx}/forward")
+        output, logits, send_counts, _dispatch = moe.forward_train(tokens, transport)
+        timer.stop(f"step/{step}/mb_{mb_idx}/forward")
+
+        # ── Loss ──
+        timer.start(f"step/{step}/mb_{mb_idx}/loss")
+        loss, loss_task, loss_aux = compute_loss(
+            output, tgt, logits, send_counts, moe.experts_per_rank, alpha,
+        )
+        timer.stop(f"step/{step}/mb_{mb_idx}/loss")
+
+        # ── Backward + step ──
+        timer.start(f"step/{step}/mb_{mb_idx}/backward")
+        optimizer.zero_grad()
+        loss.backward()
+        # Sync router gradients across ranks (gate is shared, experts are not)
+        sync_router_gradients(moe)
+        optimizer.step()
+        timer.stop(f"step/{step}/mb_{mb_idx}/backward")
+
+        mb_metrics.append({
+            "mb_idx": mb_idx,
+            "loss_total": loss.item(),
+            "loss_task": loss_task.item(),
+            "loss_aux": loss_aux.item(),
+        })
+
+    return {
+        "step": step,
+        "microbatches": mb_metrics,
+        "loss_total": sum(m["loss_total"] for m in mb_metrics) / len(mb_metrics),
+        "loss_task": sum(m["loss_task"] for m in mb_metrics) / len(mb_metrics),
+        "loss_aux": sum(m["loss_aux"] for m in mb_metrics) / len(mb_metrics),
+    }
+
+
+# ── Distributed training utilities ─────────────────────────────────────
+
+
+def sync_router_gradients(moe: MoELayer) -> None:
+    """All-reduce gradients for the router (shared across all ranks).
+
+    Each rank computes different router gradients because it sees different
+    expert outputs through all-to-all. Averaging ensures convergence.
+    """
+    world_size = dist.get_world_size()
+    for param in moe.router.parameters():
+        if param.grad is not None:
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+            param.grad /= world_size
+
+
+def broadcast_model_params(moe: MoELayer, src: int = 0) -> None:
+    """Broadcast all MoE parameters from src rank for identical initialization."""
+    for param in moe.parameters():
+        dist.broadcast(param.data, src=src)

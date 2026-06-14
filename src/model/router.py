@@ -32,15 +32,16 @@ class Router(nn.Module):
         # Gate network: linear projection → expert logits
         self.gate = nn.Linear(hidden_dim, num_experts, bias=False)
 
-    def forward(self, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Route tokens to experts.
 
         Args:
             tokens: [total_tokens, hidden_dim]
 
         Returns:
-            expert_ids: [total_tokens]  expert index per token
-            gate_weights: [total_tokens, top_k]  routing weights
+            expert_ids: [total_tokens] or [total_tokens, top_k] expert index per token
+            gate_weights: [total_tokens, top_k]  routing weights (logits for top-K, ones for fixed/random)
+            logits: [total_tokens, num_experts]  raw gate logits for load-balancing loss
         """
         total_tokens = tokens.shape[0]
 
@@ -48,15 +49,20 @@ class Router(nn.Module):
             # Round-robin: token i → expert i % num_experts
             expert_ids = torch.arange(total_tokens, device=tokens.device) % self.num_experts
             gate_weights = torch.ones(total_tokens, 1, device=tokens.device)
+            # Uniform logits — load-balancing loss returns 0 (already balanced)
+            logits = torch.zeros(total_tokens, self.num_experts, device=tokens.device)
 
         elif self.strategy == "uniform_random":
             expert_ids = torch.randint(0, self.num_experts, (total_tokens,), device=tokens.device)
             gate_weights = torch.ones(total_tokens, 1, device=tokens.device)
+            logits = torch.zeros(total_tokens, self.num_experts, device=tokens.device)
 
         elif self.strategy == "top1":
             logits = self.gate(tokens)  # [T, E]
-            gate_weights, expert_ids = torch.topk(logits, k=1, dim=-1)
-            expert_ids = expert_ids.squeeze(-1)
+            probs = F.softmax(logits, dim=-1)  # [T, E]
+            gate_weights, expert_ids = torch.max(probs, dim=-1)  # [T], [T]
+            expert_ids = expert_ids  # [T]
+            gate_weights = gate_weights.unsqueeze(-1)  # [T, 1]
 
         elif self.strategy == "top2":
             logits = self.gate(tokens)
@@ -67,4 +73,4 @@ class Router(nn.Module):
         else:
             raise ValueError(f"Unknown routing strategy: {self.strategy}")
 
-        return expert_ids, gate_weights
+        return expert_ids, gate_weights, logits

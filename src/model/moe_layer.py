@@ -4,11 +4,16 @@ This is the central module. It ties together routing, communication,
 and expert computation. The same module works in both serial and
 overlap mode -- the difference is in how the scheduler drives it.
 
-Flow (serial mode):
-  1. Route tokens -> expert_ids
+Flow (serial inference):
+  1. Route tokens -> expert_ids, gate_weights, logits
   2. All-to-all scatter (blocking) -- routes tokens to the rank that owns each expert
   3. Compute expert outputs locally (dispatch to correct local expert)
   4. All-to-all gather (blocking) -- returns tokens to original order
+  5. Combine with gate weights
+
+Flow (training):
+  Same as above, but returns (output, logits, send_counts) so the
+  scheduler can compute task loss + load-balancing loss and call backward().
 
 Flow (overlap mode):
   Step K-1: compute experts while step K scatters tokens
@@ -117,7 +122,7 @@ class MoELayer(nn.Module):
     ) -> torch.Tensor:
         """Serial (baseline) forward: route -> dispatch -> compute -> gather -> combine."""
         # Step 1: Route
-        expert_ids, gate_weights = self.router(tokens)
+        expert_ids, gate_weights, _logits = self.router(tokens)
 
         # Step 2: Dispatch (blocking all-to-all) -- handles top-K flattening internally
         dispatch = scatter_tokens(
@@ -135,6 +140,39 @@ class MoELayer(nn.Module):
         combined = combine_expert_outputs(gathered, gate_weights)
 
         return combined
+
+    def forward_train(
+        self,
+        tokens: torch.Tensor,
+        transport: Transport,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, DispatchResult]:
+        """Training forward pass: same as forward_serial but returns debug info.
+
+        Returns:
+            output: [T, hidden_dim] combined MoE output
+            logits: [T, num_experts] raw gate logits (for load-balancing loss)
+            send_counts: [world_size] per-rank dispatch counts (for load-balancing loss)
+            dispatch: DispatchResult (for gather / gradient routing)
+        """
+        # Step 1: Route
+        expert_ids, gate_weights, logits = self.router(tokens)
+
+        # Step 2: Dispatch (blocking all-to-all)
+        dispatch = scatter_tokens(
+            tokens, expert_ids, self.num_experts,
+            self.experts_per_rank, transport, async_op=False,
+        )
+
+        # Step 3: Expert computation
+        expert_out = self.compute_experts(dispatch.tokens, dispatch.local_expert_ids)
+
+        # Step 4: Gather (blocking all-to-all)
+        gathered = gather_tokens(expert_out, dispatch, transport, async_op=False)
+
+        # Step 5: Combine multi-expert outputs with gate weights
+        combined = combine_expert_outputs(gathered, gate_weights)
+
+        return combined, logits, dispatch.send_counts, dispatch
 
     def compute_experts(
         self, routed_tokens: torch.Tensor, local_expert_ids: torch.Tensor

@@ -16,10 +16,13 @@ from typing import Dict
 import torch
 
 from src.runtime.process_group import init_process_group, cleanup_process_group, get_rank
-from src.runtime.scheduler import run_serial, run_overlap
+from src.runtime.scheduler import (
+    run_serial, run_overlap, run_train_serial, broadcast_model_params,
+)
 from src.model.moe_layer import MoELayer
 from src.comm.transport import Transport
 from src.comm.topology import Topology, TopologyConfig
+from src.train.trainer import Trainer
 from src.utils.timer import Timer
 from src.utils.logging import log, log_summary
 from src.utils.seed import set_seed
@@ -95,6 +98,9 @@ def worker(
     )
     moe.set_rank(rank, world_size)
 
+    # Broadcast model params so all ranks start with identical weights
+    broadcast_model_params(moe, src=0)
+
     # ── Synthetic data ──────────────────────────────────────────
     batch_size = data_cfg["batch_size"]
     seq_len = data_cfg["seq_len"]
@@ -113,8 +119,28 @@ def worker(
     mode = runtime_cfg.get("mode", "serial")
     num_steps = runtime_cfg.get("num_steps", 5)
 
-    for step in range(num_steps):
-        if mode == "serial":
+    if mode.startswith("train_"):
+        # ── Training mode ──
+        trainer = Trainer(
+            moe=moe,
+            transport=transport,
+            timer=timer,
+            config=config,
+            rank=rank,
+            world_size=world_size,
+            trace_dir=trace_dir,
+        )
+        trainer.train()
+
+        # Save checkpoint (rank 0 only to avoid file conflicts)
+        if rank == 0:
+            ckpt_dir = config.get("profiling", {}).get("trace_dir", "outputs/traces")
+            ckpt_path = os.path.join(ckpt_dir, "checkpoint.pt")
+            trainer.save_checkpoint(ckpt_path)
+            log(rank, f"Checkpoint saved -> {ckpt_path}")
+
+    elif mode == "serial":
+        for step in range(num_steps):
             run_serial(
                 step=step,
                 microbatches=microbatches,
@@ -122,7 +148,8 @@ def worker(
                 transport=transport,
                 timer=timer,
             )
-        elif mode == "overlap":
+    elif mode == "overlap":
+        for step in range(num_steps):
             run_overlap(
                 step=step,
                 microbatches=microbatches,
@@ -130,8 +157,8 @@ def worker(
                 transport=transport,
                 timer=timer,
             )
-        else:
-            raise ValueError(f"Unknown runtime mode: {mode}")
+    else:
+        raise ValueError(f"Unknown runtime mode: {mode}")
 
     # ── Barrier and summarize ───────────────────────────────────
     transport.barrier()
