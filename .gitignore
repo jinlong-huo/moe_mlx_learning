@@ -14,8 +14,11 @@ build/
 Thumbs.db
 
 # Project outputs (large trace files, runtime artifacts)
-outputs/traces/*.json
-!outputs/traces/.gitkeep
+# Tracked reference traces are unaffected by these ignore rules
+outputs/traces/**/*.json
+outputs/traces/*.html
+outputs/traces/checkpoint.pt
+outputs/traces/merged_*.json
 *.pt
 *.pth
 
