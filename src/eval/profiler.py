@@ -55,6 +55,31 @@ class Profiler:
             }
         return rank_stats
 
+    def ocs_summary(self) -> dict:
+        """Aggregate OCS metrics across all rank trace files.
+
+        Reads the _metadata.ocs field from each trace's JSON to extract
+        per-rank circuit pool statistics without re-running the experiment.
+
+        Returns:
+            dict mapping rank -> ocs_metrics, or empty dict if no OCS data found.
+        """
+        ocs_data = {}
+        pattern = os.path.join(self.trace_dir, "rank_*_trace.json")
+        for fpath in sorted(glob.glob(pattern)):
+            basename = os.path.basename(fpath)
+            rank = int(basename.split("_")[1])
+            try:
+                with open(fpath) as f:
+                    data = json.load(f)
+                meta = data.get("_metadata", {})
+                ocs_meta = meta.get("ocs", {})
+                if ocs_meta.get("enabled"):
+                    ocs_data[rank] = ocs_meta.get("metrics", {})
+            except (json.JSONDecodeError, KeyError, IndexError):
+                continue
+        return ocs_data
+
     def merge_traces(self, output_path: str = "outputs/traces/merged_trace.json") -> str:
         """Merge all rank traces into a single Chrome Trace file.
         Each rank gets a unique PID, making them separate rows in chrome://tracing.

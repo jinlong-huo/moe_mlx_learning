@@ -17,11 +17,15 @@ import torch
 
 from src.runtime.process_group import init_process_group, cleanup_process_group, get_rank
 from src.runtime.scheduler import (
-    run_serial, run_overlap, run_train_serial, broadcast_model_params,
+    run_serial, run_overlap, run_train_serial,
+    run_ocs_pipeline, run_ocs_dbo,
+    broadcast_model_params,
 )
 from src.model.moe_layer import MoELayer
 from src.comm.transport import Transport
 from src.comm.topology import Topology, TopologyConfig
+from src.ocs.topology import OcsTopology, OcsTopologyConfig
+from src.ocs.placement import ExpertAffinityTracker
 from src.train.trainer import Trainer
 from src.utils.timer import Timer
 from src.utils.logging import log, log_summary
@@ -76,6 +80,30 @@ def worker(
         loc = topology.get_location(rank)
         log(rank, f"Topology: pod={loc.pod_id} node={loc.node_id} local={loc.local_rank}")
 
+    # -- Build OCS topology and circuit pool (if enabled) --------------------
+    ocs_cfg = config.get("ocs", {})
+    ocs_topology = None
+    ocs_pool = None
+    affinity_tracker = None
+    if ocs_cfg.get("enabled", False):
+        ocs_topology = OcsTopology(OcsTopologyConfig(
+            enabled=True,
+            max_circuits=ocs_cfg.get("max_circuits", 32),
+            reconfig_time_us=ocs_cfg.get("reconfig_time_us", 50.0),
+            circuit_latency_us=ocs_cfg.get("circuit_latency_us", 1.0),
+            circuit_bandwidth_gbps=ocs_cfg.get("circuit_bandwidth_gbps", 200.0),
+            placement_strategy=ocs_cfg.get("placement_strategy", "round_robin"),
+        ))
+        ocs_pool = ocs_topology.pool
+        log(rank, f"OCS: {ocs_cfg['max_circuits']} max circuits, "
+            f"{ocs_cfg['reconfig_time_us']}us reconfig, "
+            f"{ocs_cfg['circuit_bandwidth_gbps']}Gbps BW")
+
+        # Build affinity tracker if using affinity placement
+        if ocs_cfg.get("placement_strategy") == "affinity":
+            affinity_tracker = ExpertAffinityTracker(model_cfg["num_experts"])
+            log(rank, "OCS affinity placement: tracking expert co-activation")
+
     transport = Transport(
         timer=timer,
         comm_delay_us=delay_cfg.get("comm_delay_us", 0.0),
@@ -83,6 +111,7 @@ def worker(
         topology=topology,
         rank=rank,
         world_size=world_size,
+        ocs_circuit_pool=ocs_pool,
     )
 
     experts_per_rank = model_cfg.get("experts_per_rank", 1)
@@ -157,6 +186,35 @@ def worker(
                 transport=transport,
                 timer=timer,
             )
+    elif mode == "ocs_pipeline":
+        for step in range(num_steps):
+            # Record affinity data if tracker is active
+            if affinity_tracker is not None:
+                for tokens in microbatches:
+                    with torch.no_grad():
+                        eids, gws, _ = moe.router(tokens)
+                    affinity_tracker.record_routing(eids, gws)
+            run_ocs_pipeline(
+                step=step,
+                microbatches=microbatches,
+                moe=moe,
+                transport=transport,
+                timer=timer,
+            )
+    elif mode == "ocs_dbo":
+        for step in range(num_steps):
+            if affinity_tracker is not None:
+                for tokens in microbatches:
+                    with torch.no_grad():
+                        eids, gws, _ = moe.router(tokens)
+                    affinity_tracker.record_routing(eids, gws)
+            run_ocs_dbo(
+                step=step,
+                microbatches=microbatches,
+                moe=moe,
+                transport=transport,
+                timer=timer,
+            )
     else:
         raise ValueError(f"Unknown runtime mode: {mode}")
 
@@ -177,6 +235,16 @@ def worker(
         "comm_pct": (comm_us / total_us * 100) if total_us > 0 else 0,
         "mode": mode,
     })
+
+    # -- OCS metrics (if enabled) -----------------------------------------
+    if ocs_pool is not None:
+        m = ocs_pool.metrics
+        total_req = max(m.total_requests, 1)
+        log(rank, f"OCS: {m.circuit_reuses}/{m.total_requests} reuses "
+            f"({m.circuit_reuses/total_req*100:.1f}%), "
+            f"{m.circuit_establishes} establishes, "
+            f"{m.circuit_evictions} evictions, "
+            f"{m.total_reconfig_time_us:.0f}us reconfig total")
 
     # -- Export trace ----------------------------------------------------
     if config.get("profiling", {}).get("export_trace", True):
@@ -207,6 +275,18 @@ def worker(
                 "pod_id": loc.pod_id,
                 "node_id": loc.node_id,
                 "local_rank": loc.local_rank,
+            }
+
+        # Add OCS info if available
+        if ocs_topology is not None and ocs_pool is not None:
+            ocs_metrics = transport.get_ocs_metrics()
+            ep_meta["ocs"] = {
+                "enabled": True,
+                "max_circuits": ocs_cfg.get("max_circuits", 32),
+                "reconfig_time_us": ocs_cfg.get("reconfig_time_us", 50.0),
+                "circuit_latency_us": ocs_cfg.get("circuit_latency_us", 1.0),
+                "circuit_bandwidth_gbps": ocs_cfg.get("circuit_bandwidth_gbps", 200.0),
+                "metrics": ocs_metrics,
             }
 
         export_chrome_trace(timer.events, trace_path, pid=rank, tid=0, metadata=ep_meta)

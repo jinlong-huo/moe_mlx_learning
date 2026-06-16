@@ -38,6 +38,7 @@ class Transport:
         topology=None,   # Topology instance (optional, avoids circular import)
         rank: int = 0,
         world_size: Optional[int] = None,
+        ocs_circuit_pool=None,  # OcsCircuitPool instance (optional, None disables OCS)
     ):
         self.timer = timer
         self.comm_delay_us = comm_delay_us
@@ -45,6 +46,7 @@ class Transport:
         self.topology = topology
         self.rank = rank
         self._world_size = world_size
+        self.ocs_circuit_pool = ocs_circuit_pool
 
     def set_world_size(self, world_size: int) -> None:
         """Set the world size (call after init_process_group if not passed)."""
@@ -52,15 +54,41 @@ class Transport:
 
     # -- delay injection --------------------------------------------------
 
-    def _inject_delay(self, tensor_bytes: int = 0) -> None:
+    def _inject_delay(self, tensor_bytes: int = 0, target_ranks: Optional[list] = None) -> None:
         """Inject synthetic communication delay.
 
-        If topology is configured, uses topology-aware delay based on
-        link tier and tensor size. Otherwise falls back to flat delay + jitter.
+        Three delay modes (checked in order of priority):
+          1. OCS circuit-aware: uses OcsCircuitPool to model reconfigurable
+             optical circuits with LRU eviction. Requires target_ranks to know
+             which peers are in the collective.
+          2. Topology-aware: uses hierarchical network model (NVLink/IB/cross-pod).
+          3. Flat delay: simple fixed delay + jitter.
+
+        When OCS is active, the topology and flat delay paths are skipped —
+        OCS provides its own latency + bandwidth model via the circuit pool.
 
         Args:
             tensor_bytes: total bytes in the tensor (for bandwidth modeling)
+            target_ranks: list of destination rank IDs (required for OCS mode,
+                          ignored otherwise)
         """
+        # --- OCS circuit-aware delay (NEW, gated) ---
+        if self.ocs_circuit_pool is not None and target_ranks is not None:
+            current_ns = time.perf_counter_ns()
+            max_delay_us = 0.0
+            for dst in target_ranks:
+                if dst == self.rank:
+                    continue
+                delay_us = self.ocs_circuit_pool.compute_delay(
+                    self.rank, dst, tensor_bytes, current_ns,
+                )
+                if delay_us > max_delay_us:
+                    max_delay_us = delay_us
+            if max_delay_us > 0:
+                time.sleep(max_delay_us / 1_000_000.0)
+            return
+
+        # --- Existing topology-aware delay ---
         if self.topology is not None and self._world_size is not None:
             # Topology-aware delay
             total = self.topology.get_delay(self.rank, self._world_size, tensor_bytes)
@@ -68,7 +96,7 @@ class Transport:
                 time.sleep(total / 1_000_000.0)
             return
 
-        # Flat delay mode (backward compatible)
+        # --- Existing flat delay mode (backward compatible) ---
         if self.comm_delay_us <= 0 and self.comm_delay_jitter_us <= 0:
             return
         jitter = random.uniform(-self.comm_delay_jitter_us, self.comm_delay_jitter_us)
@@ -92,7 +120,9 @@ class Transport:
 
         # Compute tensor bytes for bandwidth-aware delay
         tensor_bytes = input_tensor.numel() * input_tensor.element_size()
-        self._inject_delay(tensor_bytes=tensor_bytes)
+        # For all-to-all, communicate with all ranks
+        all_ranks = list(range(dist.get_world_size())) if dist.is_initialized() else []
+        self._inject_delay(tensor_bytes=tensor_bytes, target_ranks=all_ranks)
 
         handle = dist.all_to_all_single(output_tensor, input_tensor, async_op=async_op)
         if self.timer and not async_op:
@@ -132,3 +162,51 @@ class Transport:
         """Wait on an async handle and record completion."""
         handle.wait()
         # Timer stop happens at the call-site so caller controls the label
+
+    # -- OCS circuit pre-establishment -----------------------------------
+
+    def pre_establish_circuits(self, target_ranks: list) -> float:
+        """Proactively establish OCS circuits to target ranks.
+
+        Called by the scheduler before firing scatter for a micro-batch.
+        Circuits are established synchronously here (reconfig time is paid
+        immediately) but in ocs_dbo mode the lookahead effectively hides
+        this cost behind the previous batch's compute.
+
+        Returns total reconfiguration time incurred (microseconds).
+        Returns 0.0 if OCS is disabled or all circuits were already hot.
+
+        Args:
+            target_ranks: list of destination rank IDs to pre-establish
+        """
+        if self.ocs_circuit_pool is None:
+            return 0.0
+
+        total_reconfig = 0.0
+        current_ns = time.perf_counter_ns()
+        for dst in target_ranks:
+            if dst == self.rank:
+                continue
+            reconfig = self.ocs_circuit_pool.establish(self.rank, dst, current_ns)
+            total_reconfig += reconfig
+        return total_reconfig
+
+    def get_ocs_metrics(self) -> dict:
+        """Return OCS circuit pool metrics for trace export.
+
+        Returns empty dict when OCS is disabled.
+        """
+        if self.ocs_circuit_pool is None:
+            return {}
+        m = self.ocs_circuit_pool.metrics
+        return {
+            "total_requests": m.total_requests,
+            "circuit_reuses": m.circuit_reuses,
+            "circuit_establishes": m.circuit_establishes,
+            "circuit_evictions": m.circuit_evictions,
+            "total_reconfig_time_us": m.total_reconfig_time_us,
+            "total_transfer_time_us": m.total_transfer_time_us,
+            "reuse_ratio": self.ocs_circuit_pool.reuse_ratio,
+            "active_circuits": self.ocs_circuit_pool.active_circuit_count,
+            "max_circuits": self.ocs_circuit_pool.max_circuits,
+        }

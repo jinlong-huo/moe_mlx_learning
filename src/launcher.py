@@ -17,18 +17,22 @@ import torch.multiprocessing as mp
 
 
 def load_config(config_path: str) -> dict:
-    """Load a YAML config file with minimal extends: support."""
+    """Load a YAML config file with recursive extends: support.
+
+    Resolves extends: chains transitively — if A extends B and B extends C,
+    the result is C merged with B merged with A.
+    """
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
-    # Resolve extends
+    # Resolve extends recursively
     if "extends" in cfg:
         base_name = cfg.pop("extends")
-        base_dir = os.path.dirname(config_path)
+        base_dir = os.path.dirname(os.path.abspath(config_path))
         base_path = os.path.join(base_dir, f"{base_name}.yaml")
         if os.path.exists(base_path):
-            with open(base_path) as f:
-                base_cfg = yaml.safe_load(f)
+            # Recursively resolve the base (handles chained extends)
+            base_cfg = load_config(base_path)
             # Merge: base values, overridden by child
             merged = _deep_merge(base_cfg, cfg)
             return merged

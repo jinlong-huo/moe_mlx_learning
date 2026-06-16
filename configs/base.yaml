@@ -48,6 +48,20 @@ topology:
   cross_pod_bandwidth_gbps: 100.0
   delay_multiplier: 1.0
 
+# Optical Circuit Switching — disabled by default.
+# Enable to model reconfigurable optical circuits between rank pairs.
+# When enabled, communication delay is modeled via circuit pool with LRU eviction:
+#   - Hot circuits (already established): low latency + high bandwidth
+#   - Cold circuits (need reconfig): pay reconfig_time_us penalty
+#   - Pool full: LRU eviction pays reconfig_time_us for the evicted circuit
+ocs:
+  enabled: false
+  max_circuits: 32              # max simultaneous circuits per rank
+  reconfig_time_us: 50.0        # MEMS switch time (1-50us typical)
+  circuit_latency_us: 1.0       # optical path latency
+  circuit_bandwidth_gbps: 200.0 # per-circuit bandwidth
+  placement_strategy: round_robin  # round_robin | affinity
+
 profiling:
   export_trace: true
   trace_dir: "outputs/traces"
