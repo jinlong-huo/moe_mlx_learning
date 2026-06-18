@@ -1,31 +1,9 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
-
-# IDE
-.vscode/
-.idea/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Project outputs (large trace files, runtime artifacts)
-# Tracked reference traces are unaffected by these ignore rules
-outputs/traces/**/*.json
-outputs/traces/*.html
-outputs/traces/checkpoint.pt
-outputs/traces/merged_*.json
-*.pt
-*.pth
-
-# Virtual environments
-venv/
 .venv/
-.env
-
-# Claude Code
-.claude/
+__pycache__/
+.cache/
+.DS_Store
+models/
+adapters/
+logs/
+*.pyc
+.vscode/
