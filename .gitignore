@@ -1,9 +1,29 @@
+# Python
 .venv/
 __pycache__/
-.cache/
+*.pyc
+*.pyo
+*.pyd
+build/
+dist/
+*.egg-info/
+
+# OS
 .DS_Store
+Thumbs.db
+
+# MLX / Model artifacts
+.cache/
 models/
 adapters/
+
+# Runtime outputs
+outputs/
 logs/
-*.pyc
+
+# IDE
 .vscode/
+.idea/
+
+# Claude Code
+.claude/
