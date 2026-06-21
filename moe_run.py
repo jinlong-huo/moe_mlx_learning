@@ -268,10 +268,10 @@ def main():
     print(f"[save] Routing trace: {log_path / 'routing.json'}")
 
     # ── Quick summary ──
-    load = trace.expert_load()
-    if load:
+    expert_load = trace.expert_load()
+    if expert_load:
         print(f"\n[routing] Expert load distribution (top 10):")
-        for expert_id, count in sorted(load.items(), key=lambda x: -x[1])[:10]:
+        for expert_id, count in sorted(expert_load.items(), key=lambda x: -x[1])[:10]:
             print(f"  expert {expert_id:3d}: {count:5d} tokens")
 
     # ── Cleanup: restore original MoE call ──
